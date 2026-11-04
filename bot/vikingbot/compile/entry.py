@@ -57,7 +57,9 @@ async def run(runtime, sources, context):
     data = {**context, "inputs": [await payload(runtime, r) for r in sources]}
     group = Group("direct", sources)
     readers = {}
-    discover = has_directory_plan(runtime.changes) and bool(runtime.changes.get("head"))
+    discover = (
+        has_directory_plan(runtime.changes) and bool(runtime.changes.get("head")) and not sources
+    )
 
     async def batch(parts=()):
         yield parts

@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from PIL import Image, ImageDraw
@@ -486,3 +486,40 @@ async def test_multi_read_and_request_budget_still_preserve_native_images(runtim
     with pytest.raises(CompileFailure, match="media budget"):
         await pipeline.model.call("compile", [{"content": result.content}], [], max_tokens=100)
     pipeline.model.provider.chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_inventory_combines_full_files_and_every_diff_page(runtime):
+    pipeline, _ = runtime
+    root, full = "viking://resources/cedar", "viking://resources/full"
+    uris = [f"{root}/{i:03}.md" for i in range(101)]
+    changes = {"diff_dirs": [root], "full_dirs": [full], "base": "base", "head": "head"}
+    pipeline.client.diff_paths = AsyncMock(
+        side_effect=lambda dirs, base, head, offset: {
+            "changes": [{"uri": uri, "change_type": "added"} for uri in uris[:100]]
+            if not offset
+            else [{"uri": uri, "change_type": "modified"} for uri in uris[99:]]
+            + [{"uri": f"{root}/deleted.md", "change_type": "deleted"}],
+            "has_more": not offset,
+            "next_offset": 100,
+        }
+    )
+    directories = [full + "/nested" * depth for depth in range(5)]
+    full_files = [f"{full}/{i:03}.md" for i in range(500)] + [f"{directories[-1]}/notes.md"]
+    listings = {
+        parent: [{"uri": child, "isDir": True}]
+        for parent, child in zip(directories[:-1], directories[1:], strict=True)
+    }
+    listings[full] += [{"uri": uri} for uri in full_files[:-1]]
+    listings[directories[-1]] = [{"uri": full_files[-1]}]
+    pipeline.client.stat = AsyncMock(return_value={"isDir": True})
+    pipeline.client.list_resources = AsyncMock(
+        side_effect=lambda uri, node_limit, offset: listings[uri][offset : offset + node_limit]
+    )
+    service = BotCompileService.__new__(BotCompileService)
+    request = pipeline.request.model_copy(update={"changes": changes})
+    files = await service._list_pipeline_source_files(pipeline.client, request)
+    assert files == sorted([*uris, *full_files])
+    assert pipeline.client.diff_paths.await_args_list == [
+        call([root], base="base", head="head", offset=offset) for offset in (0, 100)
+    ]
